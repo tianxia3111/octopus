@@ -313,13 +313,6 @@ func (i *ResponseInbound) handleReasoningContent(content *string) [][]byte {
 	// Accumulate reasoning content
 	i.accumulatedReasoning.WriteString(*content)
 
-	events = append(events, i.enqueueEvent(&ResponsesStreamEvent{
-		Type:        "response.reasoning.delta",
-		ItemID:      &i.currentItemID,
-		OutputIndex: lo.ToPtr(i.outputIndex),
-		Delta:       *content,
-	}))
-
 	// Emit reasoning_summary_text.delta
 	events = append(events, i.enqueueEvent(&ResponsesStreamEvent{
 		Type:         "response.reasoning_summary_text.delta",
@@ -362,7 +355,7 @@ func (i *ResponseInbound) ensureReasoningItemStarted() [][]byte {
 		ItemID:       &i.currentItemID,
 		OutputIndex:  lo.ToPtr(i.outputIndex),
 		SummaryIndex: lo.ToPtr(0),
-		Part:         &ResponsesContentPart{Type: "summary_text"},
+		Part:         &ResponsesContentPart{Type: "summary_text", Text: lo.ToPtr("")},
 	}))
 
 	return events
@@ -410,8 +403,9 @@ func (i *ResponseInbound) handleTextContent(content *string) [][]byte {
 			OutputIndex:  lo.ToPtr(i.outputIndex),
 			ContentIndex: lo.ToPtr(i.contentIndex),
 			Part: &ResponsesContentPart{
-				Type: "output_text",
-				Text: lo.ToPtr(""),
+				Type:        "output_text",
+				Text:        lo.ToPtr(""),
+				Annotations: &[]ResponsesAnnotation{},
 			},
 		}))
 	}
@@ -520,9 +514,14 @@ func (i *ResponseInbound) handleToolCalls(toolCalls []model.ToolCall) [][]byte {
 			events = append(events, i.closeCurrentContentPart()...)
 			events = append(events, i.closeCurrentOutputItem()...)
 
+			itemID := tc.ID
+			if itemID == "" {
+				itemID = generateItemID()
+			}
+
 			i.toolCalls[toolCallIndex] = &model.ToolCall{
 				Index: toolCallIndex,
-				ID:    tc.ID,
+				ID:    itemID,
 				Type:  tc.Type,
 				Function: model.FunctionCall{
 					Name:      tc.Function.Name,
@@ -530,17 +529,13 @@ func (i *ResponseInbound) handleToolCalls(toolCalls []model.ToolCall) [][]byte {
 				},
 			}
 
-			itemID := tc.ID
-			if itemID == "" {
-				itemID = generateItemID()
-			}
-
 			item := &ResponsesItem{
-				ID:     itemID,
-				Type:   "function_call",
-				Status: lo.ToPtr("in_progress"),
-				CallID: tc.ID,
-				Name:   tc.Function.Name,
+				ID:        itemID,
+				Type:      "function_call",
+				Status:    lo.ToPtr("in_progress"),
+				CallID:    itemID,
+				Name:      tc.Function.Name,
+				Arguments: FlexibleJSONString(""),
 			}
 
 			events = append(events, i.enqueueEvent(&ResponsesStreamEvent{
@@ -605,13 +600,6 @@ func (i *ResponseInbound) closeReasoningItem() [][]byte {
 		Part:         &ResponsesContentPart{Type: "summary_text", Text: &fullReasoning},
 	}))
 
-	events = append(events, i.enqueueEvent(&ResponsesStreamEvent{
-		Type:        "response.reasoning.done",
-		ItemID:      &i.currentItemID,
-		OutputIndex: lo.ToPtr(i.outputIndex),
-		Text:        fullReasoning,
-	}))
-
 	// Emit output_item.done with encrypted_content if signatures were accumulated.
 	// Single signature is emitted as a bare string (the common Anthropic extended-thinking
 	// case — one thinking block per turn — so the field round-trips verbatim). Multiple
@@ -674,8 +662,9 @@ func (i *ResponseInbound) closeMessageItem() [][]byte {
 			if fullText != "" {
 				text := fullText
 				contentItems = append(contentItems, ResponsesItem{
-					Type: "output_text",
-					Text: &text,
+					Type:        "output_text",
+					Text:        &text,
+					Annotations: &[]ResponsesAnnotation{},
 				})
 			}
 		case "refusal":
@@ -694,8 +683,9 @@ func (i *ResponseInbound) closeMessageItem() [][]byte {
 	// see a zero-length content array.
 	if len(contentItems) == 0 {
 		contentItems = append(contentItems, ResponsesItem{
-			Type: "output_text",
-			Text: lo.ToPtr(fullText),
+			Type:        "output_text",
+			Text:        lo.ToPtr(fullText),
+			Annotations: &[]ResponsesAnnotation{},
 		})
 	}
 
@@ -749,8 +739,9 @@ func (i *ResponseInbound) closeCurrentContentPart() [][]byte {
 			OutputIndex:  lo.ToPtr(i.outputIndex),
 			ContentIndex: lo.ToPtr(i.contentIndex),
 			Part: &ResponsesContentPart{
-				Type: "output_text",
-				Text: lo.ToPtr(fullText),
+				Type:        "output_text",
+				Text:        lo.ToPtr(fullText),
+				Annotations: &[]ResponsesAnnotation{},
 			},
 		}))
 
@@ -856,7 +847,7 @@ func (i *ResponseInbound) finalOutputItems() []ResponsesItem {
 			Role: "assistant",
 			Content: &ResponsesInput{
 				Items: []ResponsesItem{
-					{Type: "output_text", Text: &emptyText},
+					{Type: "output_text", Text: &emptyText, Annotations: &[]ResponsesAnnotation{}},
 				},
 			},
 			Status: lo.ToPtr("completed"),
@@ -1040,6 +1031,34 @@ type ResponsesItem struct {
 	InputAudio *ResponsesInputAudio `json:"input_audio,omitempty"`
 }
 
+// MarshalJSON keeps required empty fields on Responses output items. Go's
+// `omitempty` would otherwise omit them and strict clients such as Grok CLI
+// reject the stream before later delta events arrive.
+func (item ResponsesItem) MarshalJSON() ([]byte, error) {
+	type responsesItemJSON ResponsesItem
+	if item.Type == "reasoning" && len(item.Summary) == 0 {
+		return json.Marshal(struct {
+			responsesItemJSON
+			Summary []ResponsesReasoningSummary `json:"summary"`
+		}{
+			responsesItemJSON: responsesItemJSON(item),
+			Summary:           []ResponsesReasoningSummary{},
+		})
+	}
+
+	if item.Type == "function_call" && item.Arguments == "" {
+		return json.Marshal(struct {
+			responsesItemJSON
+			Arguments FlexibleJSONString `json:"arguments"`
+		}{
+			responsesItemJSON: responsesItemJSON(item),
+			Arguments:         FlexibleJSONString(""),
+		})
+	}
+
+	return json.Marshal(responsesItemJSON(item))
+}
+
 // ResponsesInputAudio mirrors OpenAI's `input_audio` content shape used for
 // audio inputs on Responses requests. O-H6.
 type ResponsesInputAudio struct {
@@ -1200,9 +1219,9 @@ type ResponsesStreamEvent struct {
 }
 
 type ResponsesContentPart struct {
-	Type        string                `json:"type"`
-	Text        *string               `json:"text,omitempty"`
-	Annotations []ResponsesAnnotation `json:"annotations,omitempty"`
+	Type        string                 `json:"type"`
+	Text        *string                `json:"text,omitempty"`
+	Annotations *[]ResponsesAnnotation `json:"annotations,omitempty"`
 }
 
 // Conversion functions

@@ -156,13 +156,28 @@ func (p *StreamProcessor) Run() error {
 
 		case r, ok := <-results:
 			if !ok {
-				// Channel closed, stream ended
+				// The read goroutine may close without forwarding its final
+				// cancellation result when readCtx is canceled concurrently.
+				// Preserve the distinction between a completed terminal stream
+				// and a genuine mid-stream client disconnect.
+				if p.config.Context.Err() != nil {
+					return p.handleDisconnect()
+				}
+				// Channel closed without cancellation, stream ended normally.
 				return p.finalize()
 			}
 
 			if r.err != nil {
 				if r.err == io.EOF {
 					return p.finalize()
+				}
+				// A client disconnect can unblock the source read and make its
+				// cancellation result race with Context.Done(). Route that result
+				// through the same terminal-event check instead of reporting a
+				// completed stream as a read failure.
+				if p.config.Context.Err() != nil &&
+					(errors.Is(r.err, context.Canceled) || errors.Is(r.err, context.DeadlineExceeded)) {
+					return p.handleDisconnect()
 				}
 				return fmt.Errorf("stream read error: %w", r.err)
 			}

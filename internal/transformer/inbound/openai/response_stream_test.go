@@ -132,11 +132,152 @@ func TestStreamReasoningBlocksSingleSignature(t *testing.T) {
 	if item.EncryptedContent == nil || *item.EncryptedContent != "sigA" {
 		t.Fatalf("expected encrypted_content=\"sigA\", got %v", item.EncryptedContent)
 	}
-	if findEvent(events, "response.reasoning.delta") == nil {
-		t.Fatalf("expected response.reasoning.delta, got %v", eventTypes(events))
+	if findEvent(events, "response.reasoning.delta") != nil || findEvent(events, "response.reasoning.done") != nil {
+		t.Fatalf("non-standard reasoning events must not be emitted, got %v", eventTypes(events))
 	}
-	if done := findEvent(events, "response.reasoning.done"); done == nil || done.Text != "thinking..." {
-		t.Fatalf("expected response.reasoning.done with full text, got %+v", done)
+	if delta := findEvent(events, "response.reasoning_summary_text.delta"); delta == nil || delta.Delta != "thinking..." {
+		t.Fatalf("expected reasoning summary delta, got %+v", delta)
+	}
+	if done := findEvent(events, "response.reasoning_summary_text.done"); done == nil || done.Text != "thinking..." {
+		t.Fatalf("expected reasoning summary done with full text, got %+v", done)
+	}
+}
+
+func TestStreamReasoningOutputItemAddedIncludesEmptySummary(t *testing.T) {
+	i := &ResponseInbound{}
+	out, err := i.TransformStreamEvents(context.Background(), []model.StreamEvent{
+		{
+			Kind:  model.StreamEventKindMessageStart,
+			ID:    "resp_grok_cli",
+			Model: "grok-4.5",
+			Role:  "assistant",
+		},
+		{
+			Kind:  model.StreamEventKindThinkingDelta,
+			ID:    "resp_grok_cli",
+			Model: "grok-4.5",
+			Delta: &model.StreamDelta{Thinking: "The user is greeting"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("TransformStreamEvents failed: %v", err)
+	}
+
+	for _, block := range bytes.Split(out, []byte("\n\n")) {
+		payload := bytes.TrimPrefix(bytes.TrimSpace(block), []byte("data: "))
+		if len(payload) == 0 || bytes.Equal(payload, []byte("[DONE]")) {
+			continue
+		}
+		var event map[string]json.RawMessage
+		if err := json.Unmarshal(payload, &event); err != nil {
+			t.Fatalf("unmarshal SSE event: %v", err)
+		}
+		var eventType string
+		if err := json.Unmarshal(event["type"], &eventType); err != nil || eventType != "response.output_item.added" {
+			continue
+		}
+
+		var item map[string]json.RawMessage
+		if err := json.Unmarshal(event["item"], &item); err != nil {
+			t.Fatalf("unmarshal output item: %v", err)
+		}
+		summary, ok := item["summary"]
+		if !ok {
+			t.Fatalf("reasoning output_item.added omitted required summary: %s", payload)
+		}
+		if !bytes.Equal(bytes.TrimSpace(summary), []byte("[]")) {
+			t.Fatalf("reasoning output_item.added summary = %s, want []", summary)
+		}
+		return
+	}
+
+	t.Fatal("reasoning response.output_item.added event not found")
+}
+
+func TestStreamReasoningSummaryPartAddedIncludesEmptyText(t *testing.T) {
+	i := &ResponseInbound{}
+	out, err := i.TransformStreamEvents(context.Background(), []model.StreamEvent{
+		{
+			Kind:  model.StreamEventKindMessageStart,
+			ID:    "resp_grok_cli",
+			Model: "grok-4.5",
+			Role:  "assistant",
+		},
+		{
+			Kind:  model.StreamEventKindThinkingDelta,
+			ID:    "resp_grok_cli",
+			Model: "grok-4.5",
+			Delta: &model.StreamDelta{Thinking: "The user is greeting"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("TransformStreamEvents failed: %v", err)
+	}
+
+	for _, block := range bytes.Split(out, []byte("\n\n")) {
+		payload := bytes.TrimPrefix(bytes.TrimSpace(block), []byte("data: "))
+		if len(payload) == 0 || bytes.Equal(payload, []byte("[DONE]")) {
+			continue
+		}
+		var event map[string]json.RawMessage
+		if err := json.Unmarshal(payload, &event); err != nil {
+			t.Fatalf("unmarshal SSE event: %v", err)
+		}
+		var eventType string
+		if err := json.Unmarshal(event["type"], &eventType); err != nil || eventType != "response.reasoning_summary_part.added" {
+			continue
+		}
+
+		var part map[string]json.RawMessage
+		if err := json.Unmarshal(event["part"], &part); err != nil {
+			t.Fatalf("unmarshal reasoning summary part: %v", err)
+		}
+		text, ok := part["text"]
+		if !ok {
+			t.Fatalf("reasoning_summary_part.added omitted required text: %s", payload)
+		}
+		if !bytes.Equal(bytes.TrimSpace(text), []byte(`""`)) {
+			t.Fatalf("reasoning_summary_part.added text = %s, want empty string", text)
+		}
+		return
+	}
+
+	t.Fatal("response.reasoning_summary_part.added event not found")
+}
+
+func TestStreamOutputTextIncludesEmptyAnnotations(t *testing.T) {
+	events := feedStream(t, []*model.InternalLLMResponse{
+		chunkWithDelta("grok-4.5", &model.Message{
+			Content: model.MessageContent{Content: lo.ToPtr("你好")},
+		}),
+		chunkWithFinish("grok-4.5", "stop"),
+	})
+
+	var addedPart, donePart *ResponsesContentPart
+	for idx := range events {
+		if events[idx].Type == "response.content_part.added" && events[idx].Part != nil && events[idx].Part.Type == "output_text" {
+			addedPart = events[idx].Part
+		}
+		if events[idx].Type == "response.content_part.done" && events[idx].Part != nil && events[idx].Part.Type == "output_text" {
+			donePart = events[idx].Part
+		}
+	}
+	for eventName, part := range map[string]*ResponsesContentPart{
+		"response.content_part.added": addedPart,
+		"response.content_part.done":  donePart,
+	} {
+		if part == nil || part.Annotations == nil || len(*part.Annotations) != 0 {
+			t.Fatalf("%s must include annotations: [], got %+v", eventName, part)
+		}
+	}
+
+	item := findItemDone(events, "message")
+	if item == nil || item.Content == nil || len(item.Content.Items) != 1 {
+		t.Fatalf("message output_item.done missing output_text content: %+v", item)
+	}
+	textItem := item.Content.Items[0]
+	if textItem.Type != "output_text" || textItem.Annotations == nil || len(*textItem.Annotations) != 0 {
+		t.Fatalf("output_item.done output_text must include annotations: [], got %+v", textItem)
 	}
 }
 
@@ -326,6 +467,56 @@ func TestStreamToolCallArgumentDeltaUsesStoredOutputIndex(t *testing.T) {
 	if lateDelta.OutputIndex == nil || *lateDelta.OutputIndex != *firstToolOutputIndex {
 		t.Fatalf("late call_a delta output_index=%v, want %d", lateDelta.OutputIndex, *firstToolOutputIndex)
 	}
+}
+
+func TestStreamFunctionCallAddedIncludesEmptyArguments(t *testing.T) {
+	i := &ResponseInbound{}
+	out, err := i.TransformStream(context.Background(), chunkWithDelta("grok-4.5", &model.Message{
+		ToolCalls: []model.ToolCall{{
+			Index: 0,
+			ID:    "call_weather",
+			Type:  "function",
+			Function: model.FunctionCall{
+				Name: "get_weather",
+			},
+		}},
+	}))
+	if err != nil {
+		t.Fatalf("TransformStream failed: %v", err)
+	}
+
+	for _, block := range bytes.Split(out, []byte("\n\n")) {
+		payload := bytes.TrimPrefix(bytes.TrimSpace(block), []byte("data: "))
+		if len(payload) == 0 || bytes.Equal(payload, []byte("[DONE]")) {
+			continue
+		}
+		var event map[string]json.RawMessage
+		if err := json.Unmarshal(payload, &event); err != nil {
+			t.Fatalf("unmarshal SSE event: %v", err)
+		}
+		var eventType string
+		if err := json.Unmarshal(event["type"], &eventType); err != nil || eventType != "response.output_item.added" {
+			continue
+		}
+
+		var item map[string]json.RawMessage
+		if err := json.Unmarshal(event["item"], &item); err != nil {
+			t.Fatalf("unmarshal function call item: %v", err)
+		}
+		arguments, ok := item["arguments"]
+		if !ok {
+			t.Fatalf("function_call output_item.added omitted required arguments: %s", payload)
+		}
+		if !bytes.Equal(bytes.TrimSpace(arguments), []byte(`""`)) {
+			t.Fatalf("function_call arguments = %s, want empty string", arguments)
+		}
+		if _, ok := item["call_id"]; !ok {
+			t.Fatalf("function_call output_item.added omitted required call_id: %s", payload)
+		}
+		return
+	}
+
+	t.Fatal("function_call response.output_item.added event not found")
 }
 
 func TestTransformStreamEventsSignatureOnlyStillOpensReasoningItem(t *testing.T) {
